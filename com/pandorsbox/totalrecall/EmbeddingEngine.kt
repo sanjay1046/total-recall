@@ -54,11 +54,12 @@ class EmbeddingEngine(context: Context) {
         val tensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(chw), longArrayOf(1, 3, 224, 224))
         val result = visionSession.run(mapOf(visionSession.inputNames.first() to tensor))
 
-        val output3d = result[0].value as Array<Array<FloatArray>>
-        val clsToken = output3d[0][0]  // [0]=batch, [0]=CLS token (index 0 of 50 tokens)
-
+        //val output3d = result[0].value as Array<Array<FloatArray>>
+        //val clsToken = output3d[0][0]  // [0]=batch, [0]=CLS token (index 0 of 50 tokens)
+        val output2d = result[0].value as Array<FloatArray>
+        val imageEmbedding = output2d[0]
         tensor.close()
-        return l2Normalize(clsToken)
+        return l2Normalize(imageEmbedding)
     }
 
     private fun l2Normalize(v: FloatArray): FloatArray {

@@ -25,6 +25,7 @@ import android.util.Log
 import android.graphics.Bitmap
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import androidx.compose.foundation.clickable
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -140,13 +141,74 @@ suspend fun runBatchEmbeddingTestAsync(
     Log.d("BatchTest", "Avg time/image: ${"%.1f".format(avg)}ms")
     Log.d("BatchTest", "JVM heap used after batch: ${usedMemMb}MB")
 }
-@Composable
+suspend fun buildPhotoIndex(
+    context: android.content.Context,
+    photos: List<Uri>,
+    engine: EmbeddingEngine,
+    count: Int,
+    onProgress: (Int, Int) -> Unit
+): List<IndexedPhoto> {
+    val n = minOf(count, photos.size)
+    val results = mutableListOf<IndexedPhoto>()
 
+    Log.d("IndexBuild", "Indexing $n images")
+
+    for (i in 0 until n) {
+        try {
+            val bitmap = loadBitmapFromUri(context, photos[i])
+            if (bitmap == null) {
+                Log.e("IndexBuild", "Image $i: bitmap null, skipping")
+                continue
+            }
+            val embedding = engine.embedImage(bitmap)
+            bitmap.recycle()
+            results.add(IndexedPhoto(photos[i], embedding))
+
+            withContext(kotlinx.coroutines.Dispatchers.Main) {
+                onProgress(i + 1, n)
+            }
+
+            if ((i + 1) % 10 == 0) {
+                System.gc()
+                kotlinx.coroutines.delay(50)
+            }
+        } catch (e: Exception) {
+            Log.e("IndexBuild", "Image $i: CRASH ${e.javaClass.simpleName}: ${e.message}", e)
+        }
+    }
+
+    PhotoIndexStore.save(context, results)
+    Log.d("IndexBuild", "Saved ${results.size} indexed photos to disk")
+    return results
+}
+suspend fun searchSimilarPhotos(
+    context: android.content.Context,
+    queryUri: Uri,
+    index: List<IndexedPhoto>,
+    engine: EmbeddingEngine,
+    topN: Int = 10
+): List<Pair<IndexedPhoto, Float>> {
+    val bitmap = loadBitmapFromUri(context, queryUri) ?: run {
+        Log.e("Search", "Query bitmap null")
+        return emptyList()
+    }
+    val queryEmbedding = engine.embedImage(bitmap)
+    bitmap.recycle()
+
+    return index
+        .map { item -> item to engine.cosineSimilarity(queryEmbedding, item.embedding) }
+        .sortedByDescending { it.second }
+        .take(topN)
+}
+@Composable
 fun GalleryScreen() {
     val coroutineScope = rememberCoroutineScope()
-    var batchProgress by remember { mutableStateOf<String?>(null) }
     val context = androidx.compose.ui.platform.LocalContext.current
+    var photoIndex by remember { mutableStateOf<List<IndexedPhoto>>(emptyList()) }
+    var indexProgress by remember { mutableStateOf<String?>(null) }
     var photos by remember { mutableStateOf<List<Uri>>(emptyList()) }
+    var searchResults by remember { mutableStateOf<List<Pair<IndexedPhoto, Float>>>(emptyList()) }
+    var isSearching by remember { mutableStateOf(false) }
     var hasPermission by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, readImagesPermission())
@@ -163,6 +225,10 @@ fun GalleryScreen() {
             launcher.launch(readImagesPermission())
         } else {
             photos = loadGalleryPhotos(context)
+            photoIndex = PhotoIndexStore.load(context)
+            if (photoIndex.isNotEmpty()) {
+                Log.d("IndexBuild", "Loaded ${photoIndex.size} photos from saved index")
+            }
         }
     }
 
@@ -178,20 +244,21 @@ fun GalleryScreen() {
                     coroutineScope.launch(kotlinx.coroutines.Dispatchers.Default) {
                         try {
                             val engine = EmbeddingEngine(context)
-                            runBatchEmbeddingTestAsync(context, photos, engine, 200) { done, total ->
-                                batchProgress = "Embedding $done / $total"
+                            val built = buildPhotoIndex(context, photos, engine, 200) { done, total ->
+                                indexProgress = "Indexing $done / $total"
                             }
-                            batchProgress = "Batch complete"
+                            photoIndex = built
+                            indexProgress = "Index built: ${built.size} photos"
                         } catch (e: Exception) {
-                            Log.e("BatchTest", "CRASH: ${e.javaClass.simpleName}: ${e.message}", e)
-                            batchProgress = "Crashed: ${e.message}"
+                            Log.e("IndexBuild", "CRASH: ${e.javaClass.simpleName}: ${e.message}", e)
+                            indexProgress = "Crashed: ${e.message}"
                         }
                     }
                 }) {
-                    Text("Batch Test (50, background)")
+                    Text("Build Index (200)")
                 }
 
-                batchProgress?.let {
+                indexProgress?.let {
                     Text(it, modifier = Modifier.padding(8.dp))
                 }
 
@@ -205,17 +272,61 @@ fun GalleryScreen() {
                 }) {
                     Text("Test Similarity")
                 }
+
+                // Main gallery grid — weight(1f) instead of fillMaxSize()
+                // so the results grid below it actually gets space too.
                 LazyVerticalGrid(
                     columns = GridCells.Fixed(3),
-                    modifier = Modifier.fillMaxSize().padding(padding),
+                    modifier = Modifier.weight(1f),
                     contentPadding = PaddingValues(4.dp)
                 ) {
                     items(photos) { uri ->
                         AsyncImage(
                             model = uri,
                             contentDescription = null,
-                            modifier = Modifier.padding(2.dp).aspectRatio(1f)
+                            modifier = Modifier
+                                .padding(2.dp)
+                                .aspectRatio(1f)
+                                .clickable {
+                                    if (photoIndex.isEmpty()) {
+                                        Log.e("Search", "Index is empty — build it first")
+                                        return@clickable
+                                    }
+                                    isSearching = true
+                                    coroutineScope.launch(kotlinx.coroutines.Dispatchers.Default) {
+                                        val engine = EmbeddingEngine(context)
+                                        val results = searchSimilarPhotos(context, uri, photoIndex, engine)
+                                        withContext(kotlinx.coroutines.Dispatchers.Main) {
+                                            searchResults = results
+                                            isSearching = false
+                                        }
+                                    }
+                                }
                         )
+                    }
+                }
+
+                // Results section — sibling of the grid above, not nested inside it.
+                if (isSearching) {
+                    Text("Searching...", modifier = Modifier.padding(8.dp))
+                }
+                if (searchResults.isNotEmpty()) {
+                    Text("Top matches:", modifier = Modifier.padding(8.dp))
+                    LazyVerticalGrid(
+                        columns = GridCells.Fixed(3),
+                        modifier = Modifier.fillMaxWidth().height(300.dp),
+                        contentPadding = PaddingValues(4.dp)
+                    ) {
+                        items(searchResults) { (item, score) ->
+                            Column(modifier = Modifier.padding(2.dp)) {
+                                AsyncImage(
+                                    model = item.uri,
+                                    contentDescription = null,
+                                    modifier = Modifier.aspectRatio(1f)
+                                )
+                                Text("%.3f".format(score), modifier = Modifier.padding(2.dp))
+                            }
+                        }
                     }
                 }
             }
